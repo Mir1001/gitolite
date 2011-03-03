@@ -1,0 +1,47 @@
+#!/bin/sh
+
+# send back the list of files affected in this push
+
+# see VR_COUNT for documentation on virtual ref scripts
+
+# this specific VR script is special in that it is also implemented in "core",
+# due to backward compatibility (delegation uses NAME/ so it is needed).
+# However, if you want to override the core functionality with something
+# else/more, you can change this file and copy it to the gitolite scripts
+# directory.
+
+ref=$1; shift
+oldsha=$1; shift
+newsha=$1; shift
+oldtree=$1; shift
+newtree=$1; shift
+
+nf=
+nc=
+args=
+while [ -n "$1" ]
+do
+    case $1 in
+        nf )
+            nf="--diff-filter=A"
+            ;;
+        nc )
+            nc=1
+            ;;
+        * )
+            args="$args $1"
+            ;;
+    esac
+    shift
+done
+
+# specify regex matching to gitolite core
+echo regex
+
+# send back the list
+if [ -n "$nc" ]
+then
+    git rev-list $newsha --not --all | xargs -r git show --name-only $nf --format=%n | grep . | sort -u
+else
+    git diff --name-only $nf $oldtree $newtree
+fi

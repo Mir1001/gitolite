@@ -1,0 +1,112 @@
+#!/bin/sh
+
+# count and report the number of files affected in this push
+
+# DEVELOPER NOTE: THIS SPECIFIC SCRIPT ALSO SERVES AS DOCUMENTATION ON HOW TO
+# CREATE YOUR OWN VIRTUAL REFS.
+
+# a vr script is invoked by the update hook, and passed 5 arguments.  The
+# first 3 are the same as those that the update hook itself gets:
+#   1.  the ref being updated (e.g. "refs/heads/master")
+#   2.  the old SHA
+#   3.  the new SHA
+# The next 2 arguments are the old and the new "tree" SHAs.
+#   4.  the old "tree" SHA (same as arg2 unless ref is being created)
+#   5.  the new "tree" SHA (same as arg3 unless ref is being deleted)
+
+# When a ref (branch/tag) is being created/deleted, the corresponding old/new
+# SHA is all zeroes.  Sadly, "git diff" does not like this all zeroes SHA as
+# an argument (they should just special case that!), so gitolite converts that
+# to the special "empty tree" SHA and sends it across.
+
+ref=$1; shift
+oldsha=$1; shift
+newsha=$1; shift
+oldtree=$1; shift
+newtree=$1; shift
+
+# any extra arguments must now be captured
+
+# This script takes three optional arguments that have specific meanings.
+
+# (1) "nf" means "new files".  This means *changing* an existing file does not
+# count, but introducing a new file to the system does.
+
+# (2) "nc" means "new commits".  Here you're limiting yourself to commits that
+# are new to the entire repo, not just new to *this* ref.  An extreme example
+# is creating a tag, where the oldsha is all 0's, but actually does not
+# introduce any new commits to the system.  Similar examples come from merging
+# another branch or forking off a new branch from an old one.
+
+# (3) "lt" means "send back a match type of 'lesser' instead of the default
+# 'greater'".  See notes on "MATCH TYPE" below for what they mean.  (You can
+# also pass in "gt" explicitly, even though it is the default).  So
+# VR_COUNT/10 and VR_COUNT-gt/10 match if there are more than 10 files
+# affected in this push, while VR_COUNT-lt/10 matches if there are less than
+# 10 files.
+
+nf=
+nc=
+ltgt=greater
+args=
+while [ -n "$1" ]
+do
+    case $1 in
+        nf )
+            nf="--diff-filter=A"
+            ;;
+        nc )
+            nc=1            # see later for the actual command change
+            ;;
+        gt )
+            ltgt=greater    # (default match type)
+            ;;
+        lt )
+            ltgt=lesser     # alternative match type if -lt was passed
+            ;;
+        * )
+            args="$args $1"
+            ;;
+    esac
+    shift
+done
+
+# MATCH TYPES
+
+# the first line to be output should be one of 'regex', 'lesser', 'greater',
+# or 'IP'.  This is needed so that the main gitolite code knows what type of
+# "matching" to perform.
+
+# - 'regex' invokes the default matching, where the 'ref' in question is regex
+#   matched against the 'refex' in the gitolite.conf file.
+
+# - 'greater' says that if the value returned by the rest of this code (the
+#   'ref'; in this case, the count of changed files) is greater than the value
+#   in the refex, the refex matches.  So a rule like
+#       -   VR_COUNT/10         =   @junior_devs
+#   would prevent junior devs from pushing commits with more than 10 files
+#   changed.  Read this literally as "count is greater than 10".
+
+#   (note: among the two numeric comparators, this is the more useful one)
+
+# - 'lesser' says the opposite; the ref returned has to be lesser than the
+#   value in the refex to match.  This should let you go the other way, like:
+#       RW  VR_COUNT-lt/10      =   @junior_devs
+#   i.e., the "count is less than 10"
+
+# - 'IP' is not yet implemented.  Patches welcome.
+
+echo $ltgt
+
+# now we must return a newline-separated list of "refs".  In this case there's
+# only one, but (for example in VR_NAME) there will normally be many.
+
+if [ -n "$nc" ]
+then
+    # this is the command that implements the "new commit" option; it's rather
+    # complex.  (Remember: at the time the update hook runs, the "ref" has not
+    # yet been updated to the "newsha" so "newsha" is not part of "--all".)
+    git rev-list $newsha --not --all | xargs -r git show --name-only $nf --format=%n | grep . | sort -u | wc -l
+else
+    git diff --name-only $nf $oldtree $newtree | wc -l
+fi

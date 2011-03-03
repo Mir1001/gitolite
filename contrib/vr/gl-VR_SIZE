@@ -1,0 +1,41 @@
+#!/bin/sh
+
+# find and report the size of the largest *new* file in this push
+
+# see VR_COUNT for documentation on virtual ref scripts
+
+# get the tree SHAs
+shift; shift; shift
+export oldtree newtree
+oldtree=$1; shift
+newtree=$1; shift
+
+ltgt=greater
+args=
+while [ -n "$1" ]
+do
+    case $1 in
+        gt )
+            ltgt=greater    # (default match type)
+            ;;
+        lt )
+            ltgt=lesser     # alternative match type if -lt was passed
+            ;;
+        * )
+            args="$args $1"
+            ;;
+    esac
+    shift
+done
+
+# the ref we send should be greater (lesser if -lt was passed in) than the
+# value in the refex
+echo $ltgt
+
+# compute the size of the largest *new* file in this push and send it back
+git diff --diff-filter=A --raw --abbrev=40 $oldtree $newtree |
+    cut -f4 -d' ' |
+    git cat-file --batch-check |
+    cut -f3 -d' ' |
+    sort -nr |
+    head -1
