@@ -1,0 +1,195 @@
+# vim: syn=sh:
+for bc in 0 1
+do
+    cd $TESTDIR
+    $TESTDIR/rollback || die "rollback failed"
+    editrc GL_BIG_CONFIG $bc
+    editrc GL_WILDREPOS 1
+
+    (cd ../contrib/vr; tar cf - gl-VR_COUNT gl-VR_SIZE |runremote tar -C .gitolite/src -xf -)
+
+    # ----------
+
+    name "INTERNAL"
+    echo "
+    @leads = u2
+    @devs = u2 u3 u4
+
+    repo foo
+        RW+                     =   u1
+        RW+     master          =   @leads @devs
+        RW+     priv/USER/      =   @leads @devs
+        RW+  20                 =   @leads @devs
+
+        -       NAME/makefile   =   @leads @devs
+        RW+     NAME/           =   @leads @devs
+
+        RW+     VR_SIZE-lt/1000 =   u1
+        RW+     VR_SIZE-lt/100  =   u2
+
+        # u2 cannot *add* a new file called 'newfile' (but can make changes to
+        # an already existing one; '-nf' means 'new file')
+        -       VR_NAME-nf/newfile  =   u2
+        RW+     VR_NAME-nf/         =   u2
+
+        # u2 cannot add a tag that contains a file called 'makefile' (due to
+        # earlier rule), but we allow him to do so for 'ncfile' (nc standing
+        # for 'new commit')
+        -       VR_NAME-nc/ncfile   =   u2
+        RW+     VR_NAME-nc/         =   u2
+
+    " | ugc
+    expect_push_ok "master -> master"
+
+    name "u1 can push changes to makefile"
+    cd ~/td
+    rm -rf foo
+    runlocal git clone u1:foo
+    expect "warning: You appear to have cloned an empty repository."
+    cd foo
+    mdc p1.c
+    runlocal git push origin master
+    expect_push_ok "master -> master"
+    runlocal git branch base
+    runlocal git push origin base
+    expect_push_ok "base -> base"
+    mdc makefile
+    runlocal git push origin master
+    expect_push_ok "master -> master"
+
+    name "u2 cannot push changes to makefile even in priv/u2/master"
+    cd ~/td
+    rm -rf foo
+    runlocal git clone u2:foo
+    expect "Cloning into foo"
+    cd foo
+    runlocal git reset --hard HEAD^
+    mdc p2.c
+    runlocal git push origin master:priv/u2/master
+    expect_push_ok "master -> priv/u2/master"
+    mdc makefile
+    runlocal git push origin master:priv/u2/master
+    expect "remote: W VR_NAME/makefile u2 DENIED by VR_NAME/makefile"
+    expect "remote: error: hook declined to update refs/heads/priv/u2/master"
+
+    name "u2 CAN push changes to makefile in priv2/u2/master"
+    cd ~/td
+    rm -rf foo
+    runlocal git clone u2:foo
+    expect "Cloning into foo"
+    cd foo
+    runlocal git reset --hard HEAD^
+    mdc p3.c
+    runlocal git push origin master:priv2/u2/master
+    expect_push_ok "master -> priv2/u2/master"
+    mdc makefile
+    runlocal git push origin master:priv2/u2/master
+    expect_push_ok "master -> priv2/u2/master"
+
+    name "u1 can push an empty commit"
+    cd ~/td
+    rm -rf foo
+    runlocal git clone u1:foo
+    expect "Cloning into foo"
+    cd foo
+    runlocal git commit --allow-empty -m empty
+    runlocal git push
+    expect_push_ok "master -> master"
+
+    name "u2 can push an empty commit"
+    cd ~/td
+    rm -rf foo
+    runlocal git clone u2:foo
+    expect "Cloning into foo"
+    cd foo
+    runlocal git commit --allow-empty -m empty
+    runlocal git push
+    expect_push_ok "master -> master"
+
+    name "u4 can push an empty commit"
+    cd ~/td
+    rm -rf foo
+    runlocal git clone u4:foo
+    expect "Cloning into foo"
+    cd foo
+    runlocal git commit --allow-empty -m empty
+    runlocal git push
+    expect_push_ok "master -> master"
+
+    name "u2 cant push a file of 500 bytes"
+    cd ~/td
+    rm -rf foo
+    runlocal git clone u2:foo
+    expect "Cloning into foo"
+    cd foo
+    yes|dd bs=1 count=750 of=f750 2>/dev/null
+    runlocal git add f750
+    runlocal git commit -m f750
+    runlocal git push
+    expect "remote: W VR_SIZE-lt/750 foo u2 DENIED by fallthru"
+
+    name "u1 can push a file of 500 bytes"
+    runlocal git push u1:foo master
+    expect_push_ok "master -> master"
+
+    name "u3 has no size limits"
+    cd ~/td
+    rm -rf foo
+    runlocal git clone u3:foo
+    expect "Cloning into foo"
+    cd foo
+    yes|dd bs=1 count=75000 of=f75000 2>/dev/null
+    runlocal git add f75000
+    runlocal git commit -m f75000
+    runlocal git push
+    expect_push_ok "master -> master"
+
+    # NAME-nf testing
+
+    name "u2 cannot add a new file called newfile"
+    cd ~/td
+    rm -rf foo
+    runlocal git clone u2:foo
+    expect "Cloning into foo"
+    cd foo
+    mdc newfile
+    runlocal git push
+    expect "remote: W VR_NAME-nf/newfile u2 DENIED by VR_NAME-nf/newfile"
+    expect "remote rejected.*hook declined"
+
+    name "u1 pushes it for him"
+    runlocal git push u1:foo master
+    expect_push_ok "master -> master"
+
+    name "u2 can now make changes to that file and push"
+    mdc newfile
+    runlocal git push
+    expect_push_ok "master -> master"
+
+    # NAME-nc testing
+
+    name "u2 cannot add a tag that contains a file called makefile"
+    cd ~/td
+    rm -rf foo
+    runlocal git clone u2:foo
+    expect "Cloning into foo"
+    cd foo
+    runlocal git tag t1
+    runlocal git push origin t1
+    expect "remote: W VR_NAME/makefile u2 DENIED by VR_NAME/makefile"
+    expect "remote: error: hook declined to update refs/tags/t1"
+
+    name "u2 can add a tag that contains a file called ncfile"
+    runlocal git checkout -t origin/base
+    expect "Branch base set up to track remote branch base from origin."
+    expect "Switched to a new branch 'base'"
+
+    mdc ncfile
+    runlocal git push u1:foo base
+    expect_push_ok "base -> base"
+    runlocal git tag t2
+    runlocal git push origin t2
+    expect "new tag.*t2 -> t2"
+
+    name "INTERNAL"
+done
