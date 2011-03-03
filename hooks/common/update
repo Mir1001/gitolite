@@ -28,6 +28,7 @@ use gitolite qw(:DEFAULT %repos);
 # ----------------------------------------------------------------------------
 
 my ($perm, $creator, $wild) = repo_rights($ENV{GL_REPO});
+trace("update: repo_rights perm is $perm");
 my $reported_repo = $ENV{GL_REPO} . ( $wild ? " ($wild)" : "" );
 
 # arguments are as supplied to an update hook by git; man githooks
@@ -54,39 +55,79 @@ $att_acc = 'D' if ( $repos{$ENV{GL_REPO}}{DELETE_IS_D} or $repos{'@all'}{DELETE_
 $att_acc = 'C' if ( $repos{$ENV{GL_REPO}}{CREATE_IS_C} or $repos{'@all'}{CREATE_IS_C} ) and $oldsha eq '0' x 40;
 
 my @allowed_refs;
-# @all repos: see comments in similar code in check_access
+# @all repos: see comments in similar code in check_score
 push @allowed_refs, @ { $repos{$ENV{GL_REPO}}{$ENV{GL_USER}} || [] };
 push @allowed_refs, @ { $repos{'@all'}       {$ENV{GL_USER}} || [] };
 push @allowed_refs, @ { $repos{$ENV{GL_REPO}}{'@all'} || [] };
 
-# prepare the list of refs to be checked
+my $minscore = 10;
 
-# previously, we just checked $ref -- the ref being updated, which is passed
-# to us by git (see man githooks).  Now we also have to treat each NAME being
-# updated as a potential "ref" and check that, if NAME-based restrictions have
-# been specified
+# check the first ref -- this is a real (git) ref, like refs/heads/master
+my ($score, $txt)           = check_ref(\@allowed_refs, $ENV{GL_REPO}, $ref, $att_acc);
+trace("update: score $score trying $att_acc on ref $ref");
+my $log_refex = $txt;   # save this for printing in the log record
+my $denymsg = $txt if $score < 10;
 
-my @refs = ($ref);      # the first ref to check is the real one
-# because making it work screws up efficiency like no tomorrow...
-if (exists $repos{$ENV{GL_REPO}}{NAME_LIMITS}) {
-    # this is special to git -- the hash of an empty tree
-    my $empty='4b825dc642cb6eb9a060e54bf8d69288fbee4904';
-    # well they're not really "trees" but $empty is indeed the empty tree so
-    # we can just pretend $oldsha/$newsha are also trees, and anyway 'git
-    # diff' only wants trees
-    my $oldtree = $oldsha eq '0' x 40 ? $empty : $oldsha;
-    my $newtree = $newsha eq '0' x 40 ? $empty : $newsha;
-    push @refs, map { chomp; s/^/NAME\//; $_; } `git diff --name-only $oldtree $newtree`;
+# collect virtual ref types, if any
+my %virtreftypes;
+for (map { $_->[1] } @allowed_refs) {
+    $virtreftypes{$1}++ if m(^VR_([\w-]+)/);
+}
+trace("update: virt refs applicable: " . join(",", sort keys %virtreftypes)) if %virtreftypes;
+
+# here's how scoring works:
+# (1) computing minscore: minimum score is 10 * number of ref types
+#   [ref types: there's exactly one "real" ref (refs/heads/master, etc), and
+#   any number of "virt"ual refs.  For each ref type applicable to this
+#   repo+user, add 10 to the minimum score]
+# (2) computing total score: each rule specified a score (default 10 for
+#   accept rules and 0 for deny rules.  The score for a reftype is the
+#   minimum of the rules in that reftype.  The total score is the sum of the
+#   scores of each reftype.  [example: 1 real ref, 20 NAME/ refs (20 files
+#   were changed), is 2 reftypes so minscore is 20.  Actual score is whatever
+#   the real ref returns + minimum(whatever the NAME/ refs return).
+
+# find virtual refs
+for my $vrt (sort keys %virtreftypes) {
+    my $vscore;
+    my $match_sub;
+
+    my @refs = get_virt_refs($vrt, $ref, $oldsha, $newsha);
+    # the first *may* be one of the following words, to indicate what sort of
+    # matching the virtref is expecting
+    if ( ($refs[0] || '') =~ m(^VR_$vrt/(regex|lesser|greater|IP)$) ) {
+        # "regex" is the default; there's no sub for this
+        $match_sub = \&match_lesser if ($1 eq 'lesser');
+        $match_sub = \&match_greater if ($1 eq 'greater');
+        $match_sub = \&match_IP  if ($1 eq 'IP');
+        shift @refs;
+    }
+
+    # if there were no virtrefs to start with (for example, an empty commit),
+    # then bumping minscore up causes problems, so bail out
+    next unless @refs;
+    # each reftype specified increases the min score by 10
+    $minscore += 10;
+
+    # allow only refs that match the $vrt, for efficiency
+    my @allowed_vrefs = grep { $_->[1] =~ m(^VR_$vrt/) } @allowed_refs;
+    for my $r (@refs) {
+        my ($rscore, $txt)  = check_ref(\@allowed_vrefs, $ENV{GL_REPO}, $r,   $att_acc, $match_sub);
+        # the score for each vref type is the minimum of the scores for the
+        # refs of that type
+        unless (defined($vscore) and $vscore < $rscore) {
+            $vscore = $rscore;
+            $denymsg ||= $txt if $rscore < 10;
+        }
+    }
+    $score += $vscore || 0;
+    trace("update: score $score after adding vscore $vscore using " . scalar(@refs) . " refs from $vrt");
 }
 
-# we potentially have many "refs" to check.  The one we print in the log is
-# the *first* one (which is a *real* ref, like refs/heads/master), while all
-# the rest (if they exist) are like NAME/something.  So we do the first one
-# separately to capture it, then run the rest (if any)
-my $log_refex = check_ref(\@allowed_refs, $ENV{GL_REPO}, (shift @refs), $att_acc);
-check_ref                (\@allowed_refs, $ENV{GL_REPO}, $_           , $att_acc) for @refs;
+die (($denymsg || "access DENIED.  Score $score < $minscore") . "\n") if $score < $minscore;
 
-# if we returned at all, all the checks succeeded.  Check secondary hooks now
+# if we came here, all the checks succeeded.  Check secondary hooks now.
+# Secondary hooks do not participate in scoring, by the way!
 $UPDATE_CHAINS_TO ||= 'hooks/update.secondary';
 -x $UPDATE_CHAINS_TO and system ( $UPDATE_CHAINS_TO, @ARGV ) and die "$UPDATE_CHAINS_TO died\n";
 

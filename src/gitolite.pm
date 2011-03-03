@@ -5,11 +5,14 @@ use Exporter 'import';
 @EXPORT = qw(
     can_read
     check_access
+    check_score
     check_ref
     check_repo_write_enabled
     cli_repo_rights
     dbg
     dos2unix
+    trace
+    get_virt_refs
     list_phy_repos
     ln_sf
     log_it
@@ -32,6 +35,10 @@ use Exporter 'import';
     mirror_mode
     mirror_listslaves
     mirror_redirectOK
+
+    match_lesser
+    match_greater
+    match_IP
 );
 @EXPORT_OK = qw(
     %repos
@@ -154,6 +161,17 @@ sub dos2unix {
     return @_;
 }
 
+sub trace {
+    return unless $ENV{GL_TRACE};
+    our $starttime;
+    unless (defined $starttime) {
+        require Time::HiRes; Time::HiRes->import ( qw(gettimeofday tv_interval) );
+        $starttime = [gettimeofday()];
+    }
+    print STDERR "## ", sprintf("%08.6f", tv_interval($starttime)), " gl-trace: ", @_, "\n";
+    $starttime = [gettimeofday()];
+}
+
 sub log_it {
     my ($ip, $logmsg);
     open my $log_fh, ">>", $ENV{GL_LOG} or die "open log failed: $!\n";
@@ -210,22 +228,25 @@ sub check_ref {
     # permission must also match the action (W/+, or C/D if used) being
     # attempted.  If none of them match, the access is denied.
 
-    # NOTE: the function DIES when access is denied, unless arg 5 is true
+    # the return value is either (10, some-string) or (0, some-string)
 
-    my ($allowed_refs, $repo, $ref, $perm, $dry_run) = @_;
+    my ($allowed_refs, $repo, $ref, $perm, $match_sub) = @_;
     my @allowed_refs = sort { $a->[0] <=> $b->[0] } @{$allowed_refs};
     for my $ar (@allowed_refs) {
         my $refex = $ar->[1];
         # refex?  sure -- a regex to match a ref against :)
-        next unless $ref =~ /^$refex/;
-        return "DENIED by $refex" if $ar->[2] eq '-' and $dry_run;
-        die "$perm $ref $ENV{GL_USER} DENIED by $refex\n" if $ar->[2] eq '-';
+        if ($match_sub) {
+            next unless &$match_sub($ref, $refex);
+        } else {
+            # match sub not passed; use the normal default
+            next unless $ref =~ /^$refex/;
+        }
+        return ($ar->[3] || 0, "$perm $ref $ENV{GL_USER} DENIED by $refex") if $ar->[2] eq '-';
 
         # as far as *this* ref is concerned we're ok
-        return $refex if ($ar->[2] =~ /\Q$perm/);
+        return ($ar->[3] || 10, $refex) if ($ar->[2] =~ /\Q$perm/);
     }
-    return "DENIED by fallthru" if $dry_run;
-    die "$perm $ref $repo $ENV{GL_USER} DENIED by fallthru\n";
+    return (0, "$perm $ref $repo $ENV{GL_USER} DENIED by fallthru");
 }
 
 # ----------------------------------------------------------------------------
@@ -674,7 +695,6 @@ sub parse_acl
         my $dr = $repo; $dr = '@all' if $r eq '@all';
         $repos{$dr}{DELETE_IS_D} = 1 if $repos{$r}{DELETE_IS_D};
         $repos{$dr}{CREATE_IS_C} = 1 if $repos{$r}{CREATE_IS_C};
-        $repos{$dr}{NAME_LIMITS} = 1 if $repos{$r}{NAME_LIMITS};
         # this needs to copy the key-value pairs from RHS to LHS, not just
         # assign RHS to LHS!  However, we want to roll in '@all' configs also
         # into the actual $repo; there's no need to preserve the distinction
@@ -892,22 +912,37 @@ sub get_memberships {
 }
 
 # ----------------------------------------------------------------------------
-#       generic check access routine
+#       build allowed refs and call check_ref for each of them
 # ----------------------------------------------------------------------------
 
+# compat layer for documented (and likely used in ADCs and such) check_access
+# when used with 4 arguments; see contrib/adc/get-rights-and-owner.in-perl
 sub check_access
 {
-    my ($repo, $ref, $aa, $dry_run) = @_;
+    if ($_[3]) {
+        my ($score, $txt) = check_score(@_[0..2]);
+        return $txt;    # this is all we return, per that doc
+    }
+    # otherwise the new check_score is the same as the old check_access
+    return check_score(@_);
+}
+
+# what used to be 'check_access' is now 'check_score' all round; see comments
+# on previous sub for more
+sub check_score
+{
+    my ($repo, $ref, $aa) = @_;
     # aa = attempted access
 
+    # level 1 check -- just one reponame as arg, gets you (perm, creator)
     my ($perm, $creator, $wild) = repo_rights($repo);
     $perm =~ s/ /_/g;
     $creator =~ s/^\(|\)$//g;
     return ($perm, $creator) unless $ref;
 
-    # until I do some major refactoring (which will bloat the update hook a
-    # bit, sadly), this code duplicates stuff in the current update hook.
+    # level 2 check -- repo, ref, aa as args, gets you (score, text)
 
+    # this code duplicates stuff in the current update hook.
     my @allowed_refs;
     # user+repo specific perms override everything else, so they come first.
     # Then perms given to specific user for @all repos, and finally perms
@@ -916,11 +951,7 @@ sub check_access
     push @allowed_refs, @ { $repos{'@all'}{$ENV{GL_USER}} || [] };
     push @allowed_refs, @ { $repos{$repo}{'@all'} || [] };
 
-    if ($dry_run) {
-        return check_ref(\@allowed_refs, $repo, $ref, $aa, $dry_run);
-    } else {
-        check_ref(\@allowed_refs, $repo, $ref, $aa);
-    }
+    return check_ref(\@allowed_refs, $repo, $ref, $aa);
 }
 
 # ----------------------------------------------------------------------------
@@ -1037,6 +1068,35 @@ sub setup_authkeys
     system("cat $ENV{HOME}/.ssh/new_authkeys > $ENV{HOME}/.ssh/authorized_keys")
         and die "couldn't write authkeys file\n";
     system("rm  $ENV{HOME}/.ssh/new_authkeys");
+}
+
+# ----------------------------------------------------------------------------
+#       V I R T U A L   R E F S
+# ----------------------------------------------------------------------------
+
+sub get_virt_refs {
+    my ($vrt, $ref, $oldsha, $newsha) = @_;
+    my @refs;
+
+    # this is special to git -- the hash of an empty tree
+    my $empty='4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+    # well they're not really "trees" but $empty is indeed the empty tree so
+    # we can just pretend $oldsha/$newsha are also trees, and anyway 'git
+    # diff' only wants trees
+    my $oldtree = $oldsha eq '0' x 40 ? $empty : $oldsha;
+    my $newtree = $newsha eq '0' x 40 ? $empty : $newsha;
+
+    my ($vrtpgm, @args) = split(/-/, $vrt);
+    if ( -x "$ENV{GL_BINDIR}/gl-VR_$vrtpgm" ) {
+        $vrtpgm = "$ENV{GL_BINDIR}/gl-VR_$vrtpgm $ref $oldsha $newsha $oldtree $newtree";
+        $vrtpgm .= " " . join(" ", @args) if @args;
+        chomp(@refs = `$vrtpgm`);
+        s/^/VR_$vrt\// for @refs;
+    } else {
+        die "virtual ref $vrt failed; you need a program called gl-VR_$vrtpgm among the gitolite scripts\n";
+    }
+
+    return @refs;
 }
 
 # ----------------------------------------------------------------------------
@@ -1159,8 +1219,8 @@ sub ext_cmd_rsync
     # ok now check if we're permitted to execute a $perm action on $path
     # (taken as a refex) using rsync.
 
-    check_access('EXTCMD/rsync', "NAME/$path", $perm);
-        # that should "die" if there's a problem
+    my ($score, $txt) = check_score('EXTCMD/rsync', "VR_NAME/$path", $perm);
+    die "$txt\n" if $score < 10;
 
     wrap_chdir($RSYNC_BASE);
     log_it();
@@ -1248,6 +1308,35 @@ sub mirror_redirectOK {
     # LATER/NEVER: include a call to an external program to override a 'true',
     # based on, say, the time of day or network load etc.  Cons: shelling out,
     # deciding the name of the program (yet another rc var?)
+}
+
+# ----------------------------------------------------------------------------
+#       VRS HELPERS
+# ----------------------------------------------------------------------------
+
+sub match_lesser
+{
+    my ($ref, $refex) = @_;
+    for ($ref, $refex) {
+        s(^VR_[-\w]+/(\d+)$)($1) or die "malformed $_ in match_lesser\n";
+    }
+    return $ref < $refex;
+}
+
+sub match_greater
+{
+    my ($ref, $refex) = @_;
+    for ($ref, $refex) {
+        s(^VR_[-\w]+/(\d+)$)($1) or die "malformed $_ in match_greater\n";
+    }
+    return $ref > $refex;
+}
+
+sub match_IP
+{
+    my ($ref, $refex) = @_;
+    die "match_IP is not yet implemented\n";
+    return 1;
 }
 
 # ------------------------------------------------------------------------------

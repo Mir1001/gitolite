@@ -167,17 +167,21 @@ sub parse_conf_line
     {
         my $perms = $1;
         my @refs; @refs = split( ' ', $2 ) if $2;
-        @refs = expand_list ( @refs );
         my @users = split ' ', $3;
+        my $score = 0;
+        $score = shift @refs if @refs and $refs[0] =~ /^-?\d+$/;
+        @refs = expand_list ( @refs );
         die "$ABRT \$GL_WILDREPOS is not set, you cant use 'C' in config\n" if $perms eq 'C' and not $GL_WILDREPOS;
 
         # if no ref is given, this PERM applies to all refs
         @refs = qw(refs/.*) unless @refs;
         # deprecation warning
-        map { print STDERR "WARNING: old syntax 'PATH/' found; please use new syntax 'NAME/'\n" if s(^PATH/)(NAME/) } @refs;
-        # fully qualify refs that dont start with "refs/" or "NAME/";
-        # prefix them with "refs/heads/"
-        @refs = map { m(^(refs|NAME)/) or s(^)(refs/heads/); $_ } @refs;
+        map { print STDERR "WARNING: really old syntax 'PATH/' found; please use new syntax 'VR_NAME/'\n" if s(^PATH/)(VR_NAME/) } @refs;
+        # (NAME is grandfathered in as VR_NAME)
+        s(^NAME/)(VR_NAME/) for @refs;
+        # now fully qualify refs that dont start with "refs/" or the VR
+        # pattern by prefixing them with "refs/heads/"
+        @refs = map { m(^(refs|VR_(?:[\w-]+))/) or s(^)(refs/heads/); $_ } @refs;
         @refs = map { s(/USER/)(/\$gl_user/); $_ } @refs;
 
         # expand the user list, unless it is just "@all"
@@ -233,10 +237,10 @@ sub parse_conf_line
                     # to avoid doing it for the large majority of repos
                     # that do *not* use NAME limits.  Setting a flag that
                     # can be checked right away will help us do that
-                    $repos{$repo}{NAME_LIMITS} = 1 if $ref =~ /^NAME\//;
                     my $p_user = $user; $p_user =~ s/creator$/creator - wild/;
-                    push @{ $repos{$repo}{$p_user} }, [ $rule_seq++, $ref, $perms ]
-                        unless $rurp_seen{$repo}{$p_user}{$ref}{$perms}++;
+                    push @{ $repos{$repo}{$p_user} },
+                        ( $score ? [ $rule_seq++, $ref, $perms, $score ] : [ $rule_seq++, $ref, $perms ] )
+                            unless $rurp_seen{$repo}{$p_user}{$ref}{$perms}++;
                 }
             }
         }

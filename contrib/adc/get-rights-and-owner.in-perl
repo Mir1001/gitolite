@@ -41,8 +41,9 @@ my $ret = check_access($repo, 'refs/heads/foo', 'W', 1);
 
 # the return value may look like this:
 #   refs/.*
-# or perhaps this, if you were denied
-#   DENIED by fallthru
+# On failure, it will have the reason, and it will contain the word DENIED
+# somewhere, for example:
+#   W refs/heads/master foo u1 DENIED by fallthru
 
 # NOTE: do NOT pass "R" as the 3rd argument.  It will seem to work because
 # you're merely testing the permissions in this code, but an *actual* "git

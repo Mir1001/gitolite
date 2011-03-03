@@ -118,11 +118,14 @@ if ($ENV{SSH_ORIGINAL_COMMAND} =~ $CUSTOM_COMMANDS) {
 # single quotes):
 #       git-receive-pack 'reponame.git'
 
-my ($verb, $repo) = ($ENV{SSH_ORIGINAL_COMMAND} =~ /^\s*(git\s+\S+|\S+)\s+'\/?(.*?)(?:\.git)?'/);
+my ($verb, $repo) = ($ENV{SSH_ORIGINAL_COMMAND} =~ /^\s*(git\s+\S+|\S+)\s+'\/?(.*?)(?:\.git|\.git-trace)?'/);
 unless ( $verb and ( $verb eq 'git-init' or $verb =~ $R_COMMANDS or $verb =~ $W_COMMANDS ) and $repo and $repo =~ $REPONAME_PATT ) {
     special_cmd ($shell_allowed);
     exit 0;
 }
+
+# set trace mode, if called for
+$ENV{GL_TRACE} = $ENV{SSH_ORIGINAL_COMMAND} =~ /\.git-trace'$/;
 
 # some final sanity checks
 die "$repo ends with a slash; I don't like that\n" if $repo =~ /\/$/;
@@ -153,8 +156,10 @@ if ( $aa eq 'W' and mirror_mode($repo) =~ /^slave of (\S+)/ ) {
 my ($perm, $creator, $wild);
 if ( $GL_ALL_READ_ALL and $verb =~ $R_COMMANDS and -d "$REPO_BASE/$repo.git") {
     $perm = 'R';
+    trace("auth: GL_ALL_READ_ALL set, verb is $verb, granting 'R'");
 } else {
     ($perm, $creator, $wild) = repo_rights($repo);
+    trace("auth: repo_rights perm is $perm");
 }
 # it was missing, and you have create perms, so create it
 new_wild_repo($repo, $user) if ($perm =~ /C/);
